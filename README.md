@@ -26,7 +26,7 @@ Install Git
 ```
 sudo apt-get install git-all
 ```
-Clone The Docker TCG Timer repository
+Clone the Docker TCG Timer repository
 ```
 git clone https://github.com/starg33kertcg/TCG_Timer_Docker.git
 ```
