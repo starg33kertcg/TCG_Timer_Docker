@@ -39,5 +39,5 @@ ADMIN_PIN='12345' # Replace with your 5-digit PIN
 ```
 Build the app image from /TCG_Timer/TCG_Timer_Docker
 ```
-sudo docker-compose build
+sudo docker compose build
 ```
