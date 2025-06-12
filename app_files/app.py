@@ -9,24 +9,25 @@ from functools import wraps
 app = Flask(__name__)
 
 # --- Read secrets from environment variables ---
-# Use the fixed secret key from the .env file for stable sessions
 app.secret_key = os.environ.get('SECRET_KEY')
-ADMIN_PIN = os.environ.get('ADMIN_PIN') # Get the admin PIN
+ADMIN_PIN = os.environ.get('ADMIN_PIN')
 
 if not app.secret_key or not ADMIN_PIN:
     raise ValueError("SECRET_KEY and ADMIN_PIN must be set as environment variables.")
 
+# --- File paths ---
 CONFIG_DIR = 'config'
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
 UPLOAD_FOLDER = os.path.join('static', 'uploads')
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
+# --- Timer States (In-memory) ---
 timer_data = {
     "1": {"id": "1", "label": "Timer 1", "enabled": False, "end_time_utc_iso": None, "paused_time_remaining_seconds": None, "is_running": False, "initial_duration_seconds": 0, "logo_filename": None},
     "2": {"id": "2", "label": "Timer 2", "enabled": False, "end_time_utc_iso": None, "paused_time_remaining_seconds": None, "is_running": False, "initial_duration_seconds": 0, "logo_filename": None}
 }
 
-# --- Config Loading/Saving ---
+# --- Config Loading/Saving (for logos) ---
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         return {"logos": []}
@@ -34,21 +35,28 @@ def load_config():
         try:
             return json.load(f)
         except json.JSONDecodeError:
-            return {"logos": []} # Return default if file is empty or corrupted
+            return {"logos": []}
 
 def save_config(data_to_save):
-    # Ensure the config directory exists before trying to write to it
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data_to_save, f, indent=4)
 
 config = load_config()
 
-# --- Authentication (Simplified for Docker/env vars) ---
+# --- Authentication ---
 def check_pin(submitted_pin):
-    # Direct comparison with the PIN from the environment variable
     return submitted_pin == ADMIN_PIN
 
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('admin_logged_in'):
+            return redirect(url_for('login', next=request.url))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- Core Routes ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if session.get('admin_logged_in'):
@@ -63,21 +71,22 @@ def login():
             return render_template('admin_login.html', error="Invalid PIN")
     return render_template('admin_login.html')
 
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('admin_logged_in'):
-            return redirect(url_for('login', next=request.url))
-        return f(*args, **kwargs)
-    return decorated_function
+@app.route('/logout')
+def logout():
+    session.pop('admin_logged_in', None)
+    return redirect(url_for('login'))
+
 @app.route('/')
 def viewer():
     return render_template('viewer.html')
+
 @app.route('/admin')
 @login_required
 def admin_dashboard():
     current_config = load_config()
     return render_template('admin_dashboard.html', timers_status=timer_data, logos=current_config.get('logos', []))
+
+# --- API Routes ---
 @app.route('/api/timer_status', methods=['GET'])
 def get_timer_status_api():
     response = {}
@@ -109,6 +118,7 @@ def get_timer_status_api():
             "logo_filename": data["logo_filename"]
         }
     return jsonify(response)
+
 @app.route('/api/control_timer/<timer_id>', methods=['POST'])
 @login_required
 def control_timer_api(timer_id):
@@ -161,6 +171,7 @@ def control_timer_api(timer_id):
         td["logo_filename"] = payload.get('logo_filename')
     app.logger.info(f"Timer {timer_id} action {action}. New state: {td}")
     return jsonify({"message": f"Timer {timer_id} action {action} processed", "newState": td})
+
 @app.route('/api/upload_logo', methods=['POST'])
 @login_required
 def upload_logo_api():
@@ -195,11 +206,13 @@ def upload_logo_api():
             app.logger.error(f"Error saving logo: {e}")
             return jsonify({"error": f"Could not save logo: {str(e)}"}), 500
     return jsonify({"error": "Upload failed, file or common name issue."}), 400
+
 @app.route('/api/get_logos', methods=['GET'])
 @login_required
 def get_logos_api():
     current_config = load_config()
     return jsonify(current_config.get('logos', []))
+
 @app.route('/api/delete_logo/<filename>', methods=['DELETE'])
 @login_required
 def delete_logo_api(filename):
