@@ -1,4 +1,4 @@
-# TCG_Timer
+<a href="https://github.com/starg33kertcg/TCG_Timer">Main TCG Timer GitHub</a>
 
 ## Docker Install Method (Debian/Ubuntu)
 Install Docker and Docker Compose *(run docker-install.sh to automate this process)*
