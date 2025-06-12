@@ -31,4 +31,4 @@ USER timer
 EXPOSE 8000
 
 # Define the command to run your app using Gunicorn
-CMD ["gunicorn", "--workers", "3", "--bind", "0.0.0.0:8000", "app:app"]
+CMD ["gunicorn", "--workers", "1", "--bind", "0.0.0.0:8000", "app:app"]
