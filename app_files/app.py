@@ -8,53 +8,95 @@ from functools import wraps
 
 app = Flask(__name__)
 
-# --- Read secrets from environment variables ---
+# --- Configuration ---
+# Read secrets from environment variables provided by docker-compose
 app.secret_key = os.environ.get('SECRET_KEY')
-ADMIN_PIN = os.environ.get('ADMIN_PIN')
+if not app.secret_key:
+    raise ValueError("A SECRET_KEY must be set as an environment variable.")
 
-if not app.secret_key or not ADMIN_PIN:
-    raise ValueError("SECRET_KEY and ADMIN_PIN must be set as environment variables.")
-
-# --- File paths ---
+# Define paths for persistent data within the container
 CONFIG_DIR = 'config'
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'config.json')
 UPLOAD_FOLDER = os.path.join('static', 'uploads')
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# --- Timer States (In-memory) ---
+# --- In-Memory State ---
+# This dictionary holds the live state of the timers. It resets if the app restarts.
 timer_data = {
     "1": {"id": "1", "label": "Timer 1", "enabled": False, "end_time_utc_iso": None, "paused_time_remaining_seconds": None, "is_running": False, "initial_duration_seconds": 0, "logo_filename": None},
     "2": {"id": "2", "label": "Timer 2", "enabled": False, "end_time_utc_iso": None, "paused_time_remaining_seconds": None, "is_running": False, "initial_duration_seconds": 0, "logo_filename": None}
 }
 
-# --- Config Loading/Saving (for logos) ---
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        return {"logos": []}
-    with open(CONFIG_FILE, 'r') as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {"logos": []}
 
+# --- Persistent Config Loading/Saving ---
+# Manages config.json, which stores data that should survive restarts.
 def save_config(data_to_save):
+    """Saves the configuration dictionary to config.json."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data_to_save, f, indent=4)
 
-config = load_config()
+def load_config():
+    """Loads config.json, creating it with defaults on the very first run."""
+    if not os.path.exists(CONFIG_FILE):
+        # On first ever run, create the config file from scratch
+        initial_pin = os.environ.get('ADMIN_PIN', '12345') # Use PIN from .env as the first PIN
+        salt = os.urandom(16).hex()
+        hashed_pin = hashlib.sha256((salt + initial_pin).encode('utf-8')).hexdigest()
+        
+        initial_config = {
+            "admin_pin_hashed": f"{salt}${hashed_pin}",
+            "logos": [],
+            "theme": {
+                "background": "#000000",
+                "font_color": "#FFFFFF",
+                "low_time_minutes": 5,
+                "warning_enabled": True
+            }
+        }
+        save_config(initial_config)
+        return initial_config
+
+    with open(CONFIG_FILE, 'r') as f:
+        try:
+            config_data = json.load(f)
+            if 'theme' not in config_data:
+                config_data['theme'] = {
+                    "background": "#000000",
+                    "font_color": "#FFFFFF",
+                    "low_time_minutes": 5,
+                    "warning_enabled": True
+                }
+                save_config(config_data)
+            return config_data
+        except json.JSONDecodeError:
+            # Handle case where file is empty or corrupted
+            return {"logos": [], "theme": {}}
+
 
 # --- Authentication ---
 def check_pin(submitted_pin):
-    return submitted_pin == ADMIN_PIN
+    """Verifies a submitted PIN against the hashed PIN in config.json."""
+    current_config = load_config()
+    if not current_config.get("admin_pin_hashed"):
+        app.logger.error("Admin PIN not found in config.")
+        return False
+    try:
+        salt, stored_hash = current_config["admin_pin_hashed"].split('$')
+        return hashlib.sha256((salt + submitted_pin).encode('utf-8')).hexdigest() == stored_hash
+    except (ValueError, AttributeError):
+        app.logger.error("Admin PIN format error in config.")
+        return False
 
 def login_required(f):
+    """Decorator to protect routes that require admin login."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not session.get('admin_logged_in'):
             return redirect(url_for('login', next=request.url))
         return f(*args, **kwargs)
     return decorated_function
+
 
 # --- Core Routes ---
 @app.route('/login', methods=['GET', 'POST'])
@@ -86,14 +128,17 @@ def admin_dashboard():
     current_config = load_config()
     return render_template('admin_dashboard.html', timers_status=timer_data, logos=current_config.get('logos', []))
 
+
 # --- API Routes ---
 @app.route('/api/timer_status', methods=['GET'])
 def get_timer_status_api():
+    """Returns the live state of the timers AND the current theme settings."""
     response = {}
+    timers_response = {}
     now_utc = datetime.utcnow()
     for timer_id, data in timer_data.items():
         if not data["enabled"]:
-            response[timer_id] = {"time_remaining_seconds": 0, "is_running": False, "times_up": False, "enabled": False, "logo_filename": data["logo_filename"]}
+            timers_response[timer_id] = {"time_remaining_seconds": 0, "is_running": False, "times_up": False, "enabled": False, "logo_filename": data["logo_filename"]}
             continue
         time_remaining = 0
         times_up = False
@@ -110,13 +155,18 @@ def get_timer_status_api():
                  times_up = True
         elif not data["is_running"] and data["initial_duration_seconds"] > 0 and data["end_time_utc_iso"] is None:
              time_remaining = data["initial_duration_seconds"]
-        response[timer_id] = {
+        timers_response[timer_id] = {
             "time_remaining_seconds": time_remaining,
             "is_running": current_is_running,
             "times_up": times_up,
             "enabled": data["enabled"],
             "logo_filename": data["logo_filename"]
         }
+    
+    current_config = load_config()
+    response['timers'] = timers_response
+    response['theme'] = current_config.get('theme', {})
+    
     return jsonify(response)
 
 @app.route('/api/control_timer/<timer_id>', methods=['POST'])
@@ -184,10 +234,8 @@ def upload_logo_api():
     if not common_name:
         return jsonify({"error": "Common name for logo is required"}), 400
     if file:
-        filename_base = "".join(c if c.isalnum() or c in [' ', '_', '-'] else '_' for c in common_name).rstrip()
-        filename_base = filename_base.replace(' ', '_')
-        original_extension = os.path.splitext(file.filename)[1]
-        if not original_extension: original_extension = ".png"
+        filename_base = "".join(c if c.isalnum() or c in [' ', '_', '-'] else '_' for c in common_name).rstrip().replace(' ', '_')
+        original_extension = os.path.splitext(file.filename)[1] or ".png"
         abs_upload_folder = os.path.join(app.root_path, UPLOAD_FOLDER)
         if not os.path.exists(abs_upload_folder):
             os.makedirs(abs_upload_folder)
@@ -195,11 +243,8 @@ def upload_logo_api():
         filepath = os.path.join(abs_upload_folder, unique_filename)
         try:
             file.save(filepath)
-            app.logger.info(f"Logo saved: {filepath}")
             current_config = load_config()
-            if 'logos' not in current_config or not isinstance(current_config['logos'], list):
-                current_config['logos'] = []
-            current_config['logos'].append({"name": common_name, "filename": unique_filename})
+            current_config.setdefault('logos', []).append({"name": common_name, "filename": unique_filename})
             save_config(current_config)
             return jsonify({"message": "Logo uploaded successfully", "logo": {"name": common_name, "filename": unique_filename}})
         except Exception as e:
@@ -216,10 +261,10 @@ def get_logos_api():
 @app.route('/api/delete_logo/<filename>', methods=['DELETE'])
 @login_required
 def delete_logo_api(filename):
-    current_config = load_config()
-    logos = current_config.get('logos', [])
     if '..' in filename or filename.startswith('/'):
         return jsonify({"error": "Invalid filename"}), 400
+    current_config = load_config()
+    logos = current_config.get('logos', [])
     logo_to_delete = next((logo for logo in logos if logo["filename"] == filename), None)
     if not logo_to_delete:
         return jsonify({"error": "Logo not found in config"}), 404
@@ -229,10 +274,43 @@ def delete_logo_api(filename):
         filepath = os.path.join(app.root_path, UPLOAD_FOLDER, filename)
         if os.path.exists(filepath):
             os.remove(filepath)
-            app.logger.info(f"Deleted logo file: {filepath}")
-        else:
-            app.logger.warning(f"Logo file not found for deletion: {filepath}")
     except Exception as e:
         app.logger.error(f"Error deleting logo file {filename}: {e}")
         return jsonify({"warning": f"Logo removed from list, but file deletion failed: {str(e)}"}), 500
     return jsonify({"message": f"Logo '{logo_to_delete['name']}' deleted successfully."})
+
+@app.route('/api/change_pin', methods=['POST'])
+@login_required
+def change_pin_api():
+    data = request.get_json()
+    current_pin = data.get('current_pin')
+    new_pin = data.get('new_pin')
+    if not all([current_pin, new_pin]) or not current_pin.isdigit() or not new_pin.isdigit() or len(new_pin) != 5:
+        return jsonify({"error": "PINs must be 5 numerical digits."}), 400
+    if not check_pin(current_pin):
+        return jsonify({"error": "Current PIN is incorrect."}), 403
+    try:
+        current_config = load_config()
+        salt = os.urandom(16).hex()
+        hashed_pin = hashlib.sha256((salt + new_pin).encode('utf-8')).hexdigest()
+        current_config["admin_pin_hashed"] = f"{salt}${hashed_pin}"
+        save_config(current_config)
+        return jsonify({"message": "PIN changed successfully!"})
+    except Exception as e:
+        app.logger.error(f"Error changing PIN: {e}")
+        return jsonify({"error": "An internal error occurred while changing the PIN."}), 500
+
+@app.route('/api/theme', methods=['GET', 'POST'])
+@login_required
+def theme_api():
+    current_config = load_config()
+    if request.method == 'POST':
+        new_theme_data = request.get_json()
+        current_config['theme'] = new_theme_data
+        save_config(current_config)
+        return jsonify({"message": "Theme updated successfully!", "theme": new_theme_data})
+    return jsonify(current_config.get('theme', {}))
+
+# This block is not used when running with Gunicorn but is useful for direct local testing
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
